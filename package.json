@@ -1,25 +1,27 @@
 {
-  "name": "unlytica",
+  "name": "example-bare",
   "version": "0.0.0",
-  "private": true,
+  "description": "",
   "type": "module",
   "scripts": {
-    "ready": "vp check && vp run -r test && vp run -r build",
-    "dev": "vp run website#dev",
-    "prepare": "vp config"
+    "start": "vite",
+    "dev": "vite",
+    "build": "vite build",
+    "serve": "vite preview",
+    "lint": "oxlint src"
   },
+  "license": "MIT",
   "devDependencies": {
-    "vite": "catalog:",
-    "vite-plus": "catalog:"
+    "@solidjs/diagnostics": "^2.0.0-rc.6",
+    "@solidjs/start-devtools": "^1.0.0-next.4",
+    "@solidjs/vite-plugin": "^3.0.0-next.38",
+    "eslint-plugin-solid": "~0.18.0",
+    "oxlint": "~1.79.0",
+    "typescript": "^5.9.2",
+    "vite": "^8.1.5"
   },
-  "devEngines": {
-    "packageManager": {
-      "name": "pnpm",
-      "version": "12.4.1",
-      "onFail": "download"
-    }
-  },
-  "engines": {
-    "node": ">=22.18.0"
+  "dependencies": {
+    "@solidjs/web": "^2.0.0-rc.6",
+    "solid-js": "^2.0.0-rc.6"
   }
 }
