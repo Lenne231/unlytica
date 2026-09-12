@@ -1,4 +1,28 @@
-import { useEffect, useState } from "react";
+import {
+  Background,
+  BackgroundVariant,
+  Controls,
+  Handle,
+  MarkerType,
+  MiniMap,
+  Position,
+  ReactFlow,
+  useEdgesState,
+  useNodesState,
+  type Edge,
+  type Node,
+  type ReactFlowInstance,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type DragEvent,
+} from "react";
 import * as duckdb from "@duckdb/duckdb-wasm";
 import duckdbWasm from "@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url";
 import mvpWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url";
@@ -6,18 +30,30 @@ import duckdbWasmEh from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
 import ehWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
 import "./App.css";
 
-type ColumnInfo = {
-  name: string;
-  type: string;
+type FileNodeData = {
+  kind: "file";
+  fileId: string;
+  fileName: string;
+  csvText: string;
+  resourceName: string;
+  createdAt: number;
+  onReplace?: (nodeId: string, file: File) => Promise<void>;
+  onCreateTable?: (fileNodeId: string) => void;
+  onRemove?: (nodeId: string) => void;
 };
 
-type TableInfo = {
-  name: string;
-  columns: ColumnInfo[];
-  expanded: boolean;
+type TableNodeData = {
+  kind: "table";
+  tableId: string;
+  tableName: string;
+  sourceFileId: string;
+  dbTableName: string;
+  query: string;
+  onRemove?: (nodeId: string) => void;
 };
 
-type QueryResultRow = Record<string, unknown>;
+type FlowNode = Node<Record<string, unknown>>;
+type FlowEdge = Edge;
 
 type ToastType = "success" | "error" | "info";
 
@@ -27,83 +63,154 @@ type Toast = {
   type: ToastType;
 };
 
-type PersistedTable = {
-  name: string;
-  csvText: string;
-};
-
-const TABLE_STORAGE_KEY = "unlytica-uploaded-tables";
-const TABLE_UI_STATE_KEY = "unlytica-table-ui-state";
+const FLOW_STORAGE_KEY = "unlytica-flow-graph";
+const FLOW_DB_NAME = "unlytica-flow-db";
+const FLOW_DB_STORE = "graph";
 
 let db: duckdb.AsyncDuckDB | null = null;
 let conn: duckdb.AsyncDuckDBConnection | null = null;
 let dbInitPromise: Promise<void> | null = null;
 
-function normalizePersistedTables(tables: PersistedTable[]): PersistedTable[] {
-  const byName = new Map<string, PersistedTable>();
-
-  for (const table of tables) {
-    if (!table?.name || !table?.csvText) {
-      continue;
+function openGraphStore() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    if (typeof window === "undefined" || !("indexedDB" in window)) {
+      reject(new Error("IndexedDB is unavailable."));
+      return;
     }
 
-    byName.set(table.name, table);
-  }
+    const request = window.indexedDB.open(FLOW_DB_NAME, 1);
 
-  return Array.from(byName.values());
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(FLOW_DB_STORE)) {
+        database.createObjectStore(FLOW_DB_STORE);
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () =>
+      reject(request.error ?? new Error("Failed to open graph store."));
+  });
 }
 
-function loadPersistedTables(): PersistedTable[] {
+function sanitizeTableName(value: string) {
+  return (
+    value
+      .trim()
+      .replace(/\.[^/.]+$/, "")
+      .replace(/[^a-zA-Z0-9_]/g, "_")
+      .replace(/^\d+/, "_$&")
+      .replace(/^_+|_+$/g, "") || "uploaded_csv"
+  );
+}
+
+function buildNodeId(prefix: string) {
+  return `${prefix}_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+}
+
+function stripRuntimeData(node: FlowNode): FlowNode {
+  const persistedData = { ...(node.data as Record<string, unknown>) };
+  delete persistedData.onReplace;
+  delete persistedData.onCreateTable;
+  delete persistedData.onRemove;
+
+  return {
+    ...node,
+    data: persistedData,
+  };
+}
+
+async function loadPersistedFlow() {
   if (typeof window === "undefined") {
-    return [];
+    return { nodes: [] as FlowNode[], edges: [] as FlowEdge[] };
   }
 
   try {
-    const rawValue = window.localStorage.getItem(TABLE_STORAGE_KEY);
-    if (!rawValue) {
-      return [];
+    const db = await openGraphStore();
+    const payload = await new Promise<{
+      nodes?: FlowNode[];
+      edges?: FlowEdge[];
+    } | null>((resolve) => {
+      const transaction = db.transaction(FLOW_DB_STORE, "readonly");
+      const request = transaction
+        .objectStore(FLOW_DB_STORE)
+        .get(FLOW_STORAGE_KEY);
+
+      request.onsuccess = () =>
+        resolve(
+          (request.result as
+            | { nodes?: FlowNode[]; edges?: FlowEdge[] }
+            | undefined) ?? null,
+        );
+      request.onerror = () => resolve(null);
+    });
+
+    if (
+      payload &&
+      Array.isArray(payload.nodes) &&
+      Array.isArray(payload.edges)
+    ) {
+      return {
+        nodes: payload.nodes,
+        edges: payload.edges,
+      };
     }
 
-    const parsed = JSON.parse(rawValue) as PersistedTable[];
-    return Array.isArray(parsed) ? normalizePersistedTables(parsed) : [];
+    db.close();
   } catch {
-    return [];
+    // Fall back to localStorage if IndexedDB is unavailable.
+  }
+
+  try {
+    const raw = window.localStorage.getItem(FLOW_STORAGE_KEY);
+    if (!raw) {
+      return { nodes: [] as FlowNode[], edges: [] as FlowEdge[] };
+    }
+
+    const parsed = JSON.parse(raw) as {
+      nodes?: FlowNode[];
+      edges?: FlowEdge[];
+    };
+    return {
+      nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
+      edges: Array.isArray(parsed.edges) ? parsed.edges : [],
+    };
+  } catch {
+    return { nodes: [] as FlowNode[], edges: [] as FlowEdge[] };
   }
 }
 
-function savePersistedTables(tables: PersistedTable[]) {
+async function savePersistedFlow(nodes: FlowNode[], edges: FlowEdge[]) {
   if (typeof window === "undefined") {
     return;
   }
 
-  const normalized = normalizePersistedTables(tables);
-  window.localStorage.setItem(TABLE_STORAGE_KEY, JSON.stringify(normalized));
-}
+  const payload = {
+    nodes: nodes.map(stripRuntimeData),
+    edges,
+  };
 
-function loadTableUiState(): TableInfo[] {
-  if (typeof window === "undefined") {
-    return [];
+  try {
+    const db = await openGraphStore();
+    await new Promise<void>((resolve) => {
+      const transaction = db.transaction(FLOW_DB_STORE, "readwrite");
+      const request = transaction
+        .objectStore(FLOW_DB_STORE)
+        .put(payload, FLOW_STORAGE_KEY);
+
+      request.onsuccess = () => resolve();
+      request.onerror = () => resolve();
+    });
+    db.close();
+  } catch {
+    // Fall back to localStorage if IndexedDB is unavailable.
   }
 
   try {
-    const rawValue = window.localStorage.getItem(TABLE_UI_STATE_KEY);
-    if (!rawValue) {
-      return [];
-    }
-
-    const parsed = JSON.parse(rawValue) as TableInfo[];
-    return Array.isArray(parsed) ? parsed : [];
+    window.localStorage.setItem(FLOW_STORAGE_KEY, JSON.stringify(payload));
   } catch {
-    return [];
+    // Ignore quota or storage failures so a refreshed app can still render.
   }
-}
-
-function saveTableUiState(tables: TableInfo[]) {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  window.localStorage.setItem(TABLE_UI_STATE_KEY, JSON.stringify(tables));
 }
 
 async function ensureDb() {
@@ -137,335 +244,559 @@ async function ensureDb() {
   await dbInitPromise;
 }
 
-function sanitizeTableName(value: string) {
+function createTableQuery(sourceFileResourceName: string) {
+  return `SELECT * FROM read_csv_auto('${sourceFileResourceName}', header = true)`;
+}
+
+function createSourceResourceName(fileNodeId: string, fileName: string) {
+  const safeName = sanitizeTableName(fileName || "uploaded_csv");
+  return `${safeName}_${fileNodeId.replace(/[^a-zA-Z0-9_]/g, "_")}.csv`;
+}
+
+function buildDerivedTableName(
+  sourceFileName: string,
+  currentNodes: FlowNode[],
+) {
+  const baseName = sanitizeTableName(String(sourceFileName || "uploaded_csv"));
+  const existingCount = currentNodes.filter((candidate) => {
+    const candidateData = candidate.data as Partial<TableNodeData>;
+    return candidateData.kind === "table";
+  }).length;
+
+  return `${baseName}_table_${existingCount + 1}`;
+}
+
+function FileNodeCard({
+  data,
+  id,
+}: {
+  data: Record<string, unknown>;
+  id: string;
+}) {
+  const fileData = data as FileNodeData;
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  if (fileData.kind !== "file") {
+    return null;
+  }
+
   return (
-    value
-      .trim()
-      .replace(/\.[^/.]+$/, "")
-      .replace(/[^a-zA-Z0-9_]/g, "_")
-      .replace(/^\d+/, "_$&")
-      .replace(/^_+|_+$/g, "") || "uploaded_csv"
+    <div className="flow-node file-node">
+      <Handle type="source" position={Position.Right} />
+      <div className="flow-node-header">
+        <span className="flow-node-tag file-tag">File</span>
+        <button
+          type="button"
+          className="node-close-button"
+          aria-label={`Remove ${fileData.fileName}`}
+          onClick={() => fileData.onRemove?.(id)}
+        >
+          ×
+        </button>
+      </div>
+
+      <div className="flow-node-title">{fileData.fileName}</div>
+      <div className="flow-node-subtitle">CSV source</div>
+
+      <div className="flow-node-actions">
+        <button type="button" onClick={() => inputRef.current?.click()}>
+          Replace
+        </button>
+        <button type="button" onClick={() => fileData.onCreateTable?.(id)}>
+          Create table
+        </button>
+      </div>
+
+      <input
+        ref={inputRef}
+        type="file"
+        accept=".csv,text/csv"
+        hidden
+        onChange={async (event) => {
+          const file = event.target.files?.[0];
+          if (file) {
+            await fileData.onReplace?.(id, file);
+          }
+          event.target.value = "";
+        }}
+      />
+    </div>
   );
 }
 
-function serializeCellValue(value: unknown): string {
-  if (value === null || value === undefined) {
-    return "";
+function TableNodeCard({
+  data,
+  id,
+}: {
+  data: Record<string, unknown>;
+  id: string;
+}) {
+  const tableData = data as TableNodeData;
+
+  if (tableData.kind !== "table") {
+    return null;
   }
 
-  if (typeof value === "bigint") {
-    return value.toString();
-  }
+  return (
+    <div className="flow-node table-node">
+      <Handle type="target" position={Position.Left} />
+      <div className="flow-node-header">
+        <span className="flow-node-tag table-tag">Table</span>
+        <button
+          type="button"
+          className="node-close-button"
+          aria-label={`Remove ${tableData.tableName}`}
+          onClick={() => tableData.onRemove?.(id)}
+        >
+          ×
+        </button>
+      </div>
 
-  if (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return String(value);
-  }
-
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-
-  if (ArrayBuffer.isView(value)) {
-    const view = value as {
-      buffer: ArrayBuffer;
-      byteOffset: number;
-      byteLength: number;
-      BYTES_PER_ELEMENT?: number;
-    };
-    const bytesPerElement = view.BYTES_PER_ELEMENT ?? 1;
-    const array = new Uint8Array(
-      view.buffer,
-      view.byteOffset,
-      view.byteLength / bytesPerElement,
-    );
-    return Array.from(array).join(", ");
-  }
-
-  if (value instanceof ArrayBuffer) {
-    return Array.from(new Uint8Array(value)).join(", ");
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((item) => serializeCellValue(item)).join(", ");
-  }
-
-  if (typeof value === "object") {
-    try {
-      return JSON.stringify(value, (_key, nestedValue) => {
-        if (typeof nestedValue === "bigint") {
-          return nestedValue.toString();
-        }
-
-        if (nestedValue instanceof Date) {
-          return nestedValue.toISOString();
-        }
-
-        if (ArrayBuffer.isView(nestedValue)) {
-          const view = nestedValue as {
-            buffer: ArrayBuffer;
-            byteOffset: number;
-            byteLength: number;
-            BYTES_PER_ELEMENT?: number;
-          };
-          const bytesPerElement = view.BYTES_PER_ELEMENT ?? 1;
-          return Array.from(
-            new Uint8Array(
-              view.buffer,
-              view.byteOffset,
-              view.byteLength / bytesPerElement,
-            ),
-          );
-        }
-
-        if (nestedValue instanceof ArrayBuffer) {
-          return Array.from(new Uint8Array(nestedValue));
-        }
-
-        return nestedValue;
-      });
-    } catch {
-      return String(value);
-    }
-  }
-
-  return String(value);
+      <div className="flow-node-title">{tableData.tableName}</div>
+      <div className="flow-node-subtitle">Derived table</div>
+      <div className="table-query-preview">{tableData.query}</div>
+    </div>
+  );
 }
 
 function App() {
-  const [status, setStatus] = useState("");
-  const [tables, setTables] = useState<TableInfo[]>(() => loadTableUiState());
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [flowInstance, setFlowInstance] = useState<ReactFlowInstance | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-  const [tablesLoading, setTablesLoading] = useState(false);
-  const [isReady, setIsReady] = useState(false);
-  const [query, setQuery] = useState("");
-  const [queryResult, setQueryResult] = useState<QueryResultRow[]>([]);
-  const [queryColumns, setQueryColumns] = useState<string[]>([]);
   const [toast, setToast] = useState<Toast | null>(null);
+  const [status, setStatus] = useState("Canvas ready");
+  const [isHydrated, setIsHydrated] = useState(false);
+  const [isBooting, setIsBooting] = useState(true);
+
+  const refreshGraph = useCallback(
+    async (graphNodes: FlowNode[], graphEdges: FlowEdge[]) => {
+      await ensureDb();
+
+      for (const tableNode of graphNodes) {
+        const tableData = tableNode.data as Partial<TableNodeData>;
+        if (tableData.kind !== "table") {
+          continue;
+        }
+
+        const sourceNode = graphNodes.find((node) => {
+          const fileData = node.data as Partial<FileNodeData>;
+          if (fileData.kind !== "file") {
+            return false;
+          }
+
+          return node.id === tableData.sourceFileId;
+        });
+
+        if (!sourceNode) {
+          continue;
+        }
+
+        const sourceFileData = sourceNode.data as Partial<FileNodeData>;
+        if (sourceFileData.kind !== "file") {
+          continue;
+        }
+
+        const csvResourceName =
+          sourceFileData.resourceName ||
+          createSourceResourceName(
+            sourceNode.id,
+            String(sourceFileData.fileName ?? "uploaded_csv"),
+          );
+        const csvText = String(sourceFileData.csvText ?? "");
+        await db!.registerFileText(csvResourceName, csvText);
+
+        await conn!.query(
+          `CREATE OR REPLACE TABLE "${String(tableData.dbTableName ?? tableNode.id)}" AS ${String(tableData.query ?? "SELECT 1")};`,
+        );
+      }
+
+      void savePersistedFlow(graphNodes, graphEdges);
+    },
+    [],
+  );
+
+  const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>([]);
+  const nodesRef = useRef<FlowNode[]>(nodes);
+  const edgesRef = useRef<FlowEdge[]>(edges);
 
   useEffect(() => {
-    saveTableUiState(tables);
-  }, [tables]);
+    nodesRef.current = nodes;
+  }, [nodes]);
+
+  useEffect(() => {
+    edgesRef.current = edges;
+  }, [edges]);
+
+  const removeNode = useCallback(
+    async (nodeId: string) => {
+      const currentNodes = nodesRef.current;
+      const currentEdges = edgesRef.current;
+      const nodeToDelete = currentNodes.find(
+        (candidate) => candidate.id === nodeId,
+      );
+      if (!nodeToDelete) {
+        return;
+      }
+
+      const hasDependents = currentEdges.some((edge) => edge.source === nodeId);
+      if (hasDependents) {
+        setToast({
+          id: Date.now(),
+          message: "This node still has dependent nodes and cannot be deleted.",
+          type: "error",
+        });
+        setError("Delete blocked: dependent nodes still exist.");
+        return;
+      }
+
+      const tableData = nodeToDelete.data as Partial<TableNodeData>;
+
+      await ensureDb();
+      if (tableData.kind === "table" && tableData.dbTableName && conn) {
+        await conn.query(
+          `DROP TABLE IF EXISTS "${String(tableData.dbTableName)}";`,
+        );
+      }
+
+      setNodes((currentNodesState) =>
+        currentNodesState.filter((candidate) => candidate.id !== nodeId),
+      );
+      setEdges((currentEdgesState) =>
+        currentEdgesState.filter(
+          (edge) => edge.source !== nodeId && edge.target !== nodeId,
+        ),
+      );
+      setToast({
+        id: Date.now(),
+        message: "Node and backing resource removed.",
+        type: "success",
+      });
+      setError(null);
+    },
+    [setEdges, setNodes],
+  );
+
+  const attachRuntimeHandlers = useCallback(
+    (node: FlowNode): FlowNode => {
+      const nodeData = node.data as Partial<FileNodeData> &
+        Partial<TableNodeData>;
+
+      if (nodeData.kind === "file") {
+        return {
+          ...node,
+          data: {
+            ...nodeData,
+            onCreateTable: (fileNodeId: string) => {
+              setNodes((currentNodes) => {
+                const sourceNode = currentNodes.find(
+                  (candidate) => candidate.id === fileNodeId,
+                );
+                if (!sourceNode) {
+                  return currentNodes;
+                }
+
+                const sourceData = sourceNode.data as Partial<FileNodeData>;
+                if (sourceData.kind !== "file") {
+                  return currentNodes;
+                }
+
+                const tableId = buildNodeId("table");
+                const tableName = buildDerivedTableName(
+                  String(sourceData.fileName ?? "uploaded_csv"),
+                  currentNodes,
+                );
+                const dbTableName = `table_${tableName}_${tableId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+                const csvResourceName =
+                  sourceData.resourceName ||
+                  createSourceResourceName(
+                    sourceNode.id,
+                    String(sourceData.fileName ?? "uploaded_csv"),
+                  );
+                const tableNode: FlowNode = {
+                  id: tableId,
+                  type: "tableNode",
+                  position: {
+                    x: sourceNode.position.x + 300,
+                    y: sourceNode.position.y + 40,
+                  },
+                  data: {
+                    kind: "table",
+                    tableId,
+                    tableName,
+                    sourceFileId: sourceNode.id,
+                    dbTableName,
+                    query: createTableQuery(csvResourceName),
+                  },
+                };
+
+                const nextNodes = [...currentNodes, tableNode];
+                const edge: FlowEdge = {
+                  id: `edge-${sourceNode.id}-${tableId}`,
+                  source: sourceNode.id,
+                  target: tableId,
+                  markerEnd: { type: MarkerType.ArrowClosed },
+                };
+
+                setEdges((currentEdges) => {
+                  const nextEdges = [...currentEdges, edge];
+                  void refreshGraph(nextNodes, nextEdges);
+                  return nextEdges;
+                });
+
+                return nextNodes;
+              });
+            },
+            onRemove: (nodeId: string) => {
+              void removeNode(nodeId);
+            },
+            onReplace: async (nodeId: string, file: File) => {
+              if (!file.name.toLowerCase().endsWith(".csv")) {
+                setError("Please select a CSV file.");
+                return;
+              }
+
+              const csvText = await file.text();
+              setNodes((currentNodes) => {
+                const sourceNode = currentNodes.find(
+                  (candidate) => candidate.id === nodeId,
+                );
+                const sourceData = sourceNode?.data as
+                  | Partial<FileNodeData>
+                  | undefined;
+                if (!sourceNode || sourceData?.kind !== "file") {
+                  return currentNodes;
+                }
+
+                const nextResourceName = createSourceResourceName(
+                  nodeId,
+                  file.name,
+                );
+
+                const updatedNodes = currentNodes.map((candidate) => {
+                  const candidateData = candidate.data as Partial<FileNodeData>;
+                  if (
+                    candidate.id !== nodeId ||
+                    candidateData.kind !== "file"
+                  ) {
+                    return candidate;
+                  }
+
+                  return {
+                    ...candidate,
+                    data: {
+                      ...candidateData,
+                      fileName: file.name,
+                      csvText,
+                      resourceName: nextResourceName,
+                      createdAt: Date.now(),
+                    },
+                  };
+                });
+
+                const finalNodes = updatedNodes.map((candidate) => {
+                  const candidateData =
+                    candidate.data as Partial<TableNodeData>;
+                  if (
+                    candidateData.kind !== "table" ||
+                    candidateData.sourceFileId !== nodeId
+                  ) {
+                    return candidate;
+                  }
+
+                  return {
+                    ...candidate,
+                    data: {
+                      ...candidateData,
+                      query: createTableQuery(nextResourceName),
+                    },
+                  };
+                });
+
+                setEdges((currentEdges) => {
+                  void refreshGraph(finalNodes, currentEdges);
+                  return currentEdges;
+                });
+
+                return finalNodes;
+              });
+
+              setStatus("Updated file");
+              setToast({
+                id: Date.now(),
+                message: `Replaced ${file.name}.`,
+                type: "success",
+              });
+              setError(null);
+            },
+          } as unknown as FileNodeData,
+        };
+      }
+
+      return {
+        ...node,
+        data: {
+          ...nodeData,
+          onRemove: (nodeId: string) => {
+            void removeNode(nodeId);
+          },
+        } as unknown as TableNodeData,
+      };
+    },
+    [refreshGraph, removeNode],
+  );
+
+  const addFileNode = useCallback(
+    async (file: File, position = { x: 120, y: 100 }) => {
+      if (!file.name.toLowerCase().endsWith(".csv")) {
+        setError("Please select a CSV file.");
+        return;
+      }
+
+      const csvText = await file.text();
+      const fileId = buildNodeId("file");
+      const resourceName = createSourceResourceName(fileId, file.name);
+      const nextNode: FlowNode = {
+        id: fileId,
+        type: "fileNode",
+        position,
+        data: {
+          kind: "file",
+          fileId,
+          fileName: file.name,
+          csvText,
+          resourceName,
+          createdAt: Date.now(),
+        },
+      };
+
+      const hydratedNode = attachRuntimeHandlers(nextNode);
+      setNodes((currentNodes) => {
+        const nextNodes = [...currentNodes, hydratedNode];
+        void refreshGraph(nextNodes, edgesRef.current);
+        return nextNodes;
+      });
+      setStatus(`Added ${file.name}`);
+      setToast({
+        id: Date.now(),
+        message: `Added ${file.name} to the canvas.`,
+        type: "success",
+      });
+      setError(null);
+    },
+    [attachRuntimeHandlers, refreshGraph, setNodes],
+  );
 
   useEffect(() => {
     if (!toast) {
       return undefined;
     }
 
-    const timeoutId = window.setTimeout(() => {
-      setToast(null);
-    }, 3000);
-
-    return () => {
-      window.clearTimeout(timeoutId);
-    };
+    const timeoutId = window.setTimeout(() => setToast(null), 3000);
+    return () => window.clearTimeout(timeoutId);
   }, [toast]);
 
-  function showToast(message: string, type: ToastType = "success") {
-    setToast({
-      id: Date.now() + Math.random(),
-      message,
-      type,
-    });
-  }
-
-  const refreshTables = async () => {
-    setTablesLoading(true);
-
-    try {
-      await ensureDb();
-      const result = await conn!.query<any>("SHOW TABLES;");
-      const names = result
-        .toArray()
-        .map((row) => String(Object.values(row)[0] ?? ""));
-
-      const previousExpanded = new Map(
-        tables.map((table) => [table.name, table.expanded]),
-      );
-      const tableInfos: TableInfo[] = [];
-
-      for (const tableName of names) {
-        const describeResult = await conn!.query<any>(
-          `DESCRIBE "${tableName}";`,
+  useEffect(() => {
+    const bootstrap = async () => {
+      try {
+        await ensureDb();
+        const persisted = await loadPersistedFlow();
+        const hydratedNodes = persisted.nodes.map((node) =>
+          attachRuntimeHandlers(node),
         );
-        const columns = describeResult
-          .toArray()
-          .map((row: Record<string, unknown>) => ({
-            name: String(row.column_name ?? row["column_name"] ?? ""),
-            type: String(row.column_type ?? row["column_type"] ?? "unknown"),
-          }))
-          .filter((column) => column.name);
+        setNodes(hydratedNodes);
+        setEdges(persisted.edges);
+        setIsHydrated(true);
+        setIsBooting(false);
+        await refreshGraph(hydratedNodes, persisted.edges);
+        setStatus("Canvas ready");
+      } catch (bootError) {
+        const message =
+          bootError instanceof Error
+            ? bootError.message
+            : "DuckDB failed to initialize.";
+        setError(message);
+        setStatus("DuckDB failed to initialize.");
+        setIsBooting(false);
+      }
+    };
 
-        tableInfos.push({
-          name: tableName,
-          columns,
-          expanded: previousExpanded.get(tableName) ?? false,
+    void bootstrap();
+  }, [attachRuntimeHandlers, refreshGraph, setEdges, setNodes]);
+
+  useEffect(() => {
+    if (!isHydrated) {
+      return;
+    }
+
+    void savePersistedFlow(nodes, edges);
+  }, [edges, isHydrated, nodes]);
+
+  const handleFileSelection = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.target.files ?? []);
+      if (files.length === 0) {
+        event.target.value = "";
+        return;
+      }
+
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        await addFileNode(file, {
+          x: Math.max(80, (nodesRef.current.length + index) * 30),
+          y: Math.max(80, (nodesRef.current.length + index) * 50),
         });
       }
 
-      setTables(tableInfos);
-
-      if (!query && tableInfos.length > 0) {
-        setQuery(`SELECT * FROM "${tableInfos[0].name}" LIMIT 10;`);
-      }
-    } finally {
-      setTablesLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    ensureDb()
-      .then(async () => {
-        setTablesLoading(true);
-
-        try {
-          const savedTables = loadPersistedTables();
-
-          for (const savedTable of savedTables) {
-            const csvFileName = `${savedTable.name}.csv`;
-            await db!.registerFileText(csvFileName, savedTable.csvText);
-            await conn!.query(
-              `CREATE OR REPLACE TABLE "${savedTable.name}" AS SELECT * FROM read_csv_auto('${csvFileName}', header = true);`,
-            );
-          }
-
-          setIsReady(true);
-          await refreshTables();
-        } finally {
-          setTablesLoading(false);
-        }
-      })
-      .catch((initError) => {
-        setError(
-          initError instanceof Error
-            ? initError.message
-            : "DuckDB could not initialize.",
-        );
-        setStatus("DuckDB failed to initialize.");
-      });
-  }, []);
-
-  async function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-
-    if (!file) {
-      return;
-    }
-
-    if (!file.name.toLowerCase().endsWith(".csv")) {
-      setError("Please select a CSV file.");
-      return;
-    }
-
-    if (!isReady) {
-      setError(
-        "DuckDB is still initializing. Please wait a moment and try again.",
-      );
-      return;
-    }
-
-    try {
-      setError(null);
-      setIsLoading(true);
-      setStatus(`Importing ${file.name}...`);
-
-      await ensureDb();
-
-      const tableBaseName = sanitizeTableName(file.name);
-      const csvFileName = `${tableBaseName}.csv`;
-      const csvText = await file.text();
-
-      await db!.registerFileText(csvFileName, csvText);
-      await conn!.query(
-        `CREATE OR REPLACE TABLE "${tableBaseName}" AS SELECT * FROM read_csv_auto('${csvFileName}', header = true);`,
-      );
-
-      const existingTables = loadPersistedTables();
-      const nextTables = [
-        ...existingTables.filter((table) => table.name !== tableBaseName),
-        { name: tableBaseName, csvText },
-      ];
-      savePersistedTables(nextTables);
-
-      await refreshTables();
-      setStatus("Import complete.");
-      showToast(`Imported CSV as table "${tableBaseName}".`);
-    } catch (importError) {
-      const message =
-        importError instanceof Error
-          ? importError.message
-          : "Failed to import CSV file.";
-      setError(message);
-      setStatus("Import failed.");
-      showToast(message, "error");
-    } finally {
-      setIsLoading(false);
       event.target.value = "";
-    }
-  }
+    },
+    [addFileNode],
+  );
 
-  function toggleTable(tableName: string) {
-    setTables((currentTables) =>
-      currentTables.map((table) =>
-        table.name === tableName
-          ? { ...table, expanded: !table.expanded }
-          : table,
+  const onDrop = useCallback(
+    async (event: DragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      const files = Array.from(event.dataTransfer.files ?? []);
+      if (files.length === 0) {
+        return;
+      }
+
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        const position = flowInstance
+          ? flowInstance.screenToFlowPosition({
+              x: event.clientX + index * 24,
+              y: event.clientY + index * 20,
+            })
+          : { x: 120 + index * 30, y: 80 + index * 30 };
+
+        await addFileNode(file, position);
+      }
+    },
+    [addFileNode, flowInstance],
+  );
+
+  const nodeTypes = useMemo(
+    () => ({
+      fileNode: (props: { data: Record<string, unknown>; id: string }) => (
+        <FileNodeCard {...props} />
       ),
-    );
-  }
+      tableNode: (props: { data: Record<string, unknown>; id: string }) => (
+        <TableNodeCard {...props} />
+      ),
+    }),
+    [],
+  );
 
-  async function executeQuery() {
-    if (!query.trim()) {
-      return;
-    }
-
-    try {
-      setError(null);
-      setIsLoading(true);
-      setStatus("Executing query...");
-
-      await ensureDb();
-      const result = await conn!.query<any>(query);
-      const rows = result.toArray();
-      const columns = result.schema.fields.map((field) => field.name);
-
-      setQueryResult(rows);
-      setQueryColumns(columns);
-      setStatus("Query executed successfully.");
-      showToast("Query executed successfully.");
-      await refreshTables();
-    } catch (queryError) {
-      const message =
-        queryError instanceof Error ? queryError.message : "Query failed.";
-      setError(message);
-      setStatus("Query failed.");
-      showToast(message, "error");
-      setQueryResult([]);
-      setQueryColumns([]);
-    } finally {
-      setIsLoading(false);
-    }
-  }
-
-  if (!isReady) {
+  if (isBooting) {
     return (
       <div className="boot-screen">
         <div className="boot-card">
-          <div className="boot-spinner" aria-hidden="true" />
-          <h1>
-            DuckDB is initializing
-            <span className="boot-dots" aria-hidden="true">
-              <span>.</span>
-              <span>.</span>
-              <span>.</span>
-            </span>
-          </h1>
-          <p>Preparing DuckDB… this may take a moment on the first run.</p>
-          {error ? <p className="error boot-error">{error}</p> : null}
+          <div className="boot-spinner" aria-label="Loading graph" />
+          <h1>Loading canvas…</h1>
+          <p>Restoring saved nodes and tables.</p>
         </div>
       </div>
     );
@@ -483,124 +814,67 @@ function App() {
         </div>
       ) : null}
 
-      <main className="workspace-shell">
-        <aside className="sidebar panel">
-          <div className="panel-header">
-            <h2>Tables</h2>
+      <div className="app-shell">
+        <header className="topbar">
+          <div>
+            <p className="eyebrow">Unlytica</p>
+            <h1>Flow canvas</h1>
           </div>
 
-          <div className="upload-box">
-            <label className="file-picker">
-              <span>{isLoading ? "Importing…" : "Upload CSV"}</span>
-              <input
-                type="file"
-                accept=".csv,text/csv"
-                onChange={handleFileChange}
-              />
-            </label>
-          </div>
-
-          <div className="table-list">
-            {tablesLoading ? (
-              <p className="empty-state">Loading tables...</p>
-            ) : tables.length === 0 ? (
-              <p className="empty-state">No tables imported yet.</p>
-            ) : (
-              tables.map((table) => (
-                <div key={table.name} className="table-item">
-                  <button
-                    type="button"
-                    className="table-toggle"
-                    onClick={() => toggleTable(table.name)}
-                  >
-                    <span>{table.expanded ? "▾" : "▸"}</span>
-                    <span>{table.name}</span>
-                  </button>
-
-                  {table.expanded ? (
-                    <ul className="column-list">
-                      {table.columns.map((column) => (
-                        <li key={`${table.name}-${column.name}`}>
-                          <span className="column-name">{column.name}</span>
-                          <span className="column-type">{column.type}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : null}
-                </div>
-              ))
-            )}
-          </div>
-        </aside>
-
-        <section className="main-panel panel">
-          <div className="panel-header">
-            <h2>Query</h2>
+          <div className="toolbar-actions">
             <button
               type="button"
-              className="run-button"
-              onClick={executeQuery}
-              disabled={isLoading || !isReady}
+              className="primary-button"
+              onClick={() => fileInputRef.current?.click()}
             >
-              {isLoading ? "Running..." : "Run query"}
+              Add CSV
             </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,text/csv"
+              hidden
+              onChange={handleFileSelection}
+            />
           </div>
+        </header>
 
-          <textarea
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            className="query-editor"
-            placeholder="SELECT * FROM my_table;"
-          />
+        <div className="status-bar">{status}</div>
+        {error ? <div className="error-banner">{error}</div> : null}
 
-          <div className="status-bar">
-            {isLoading ||
-            status.startsWith("Importing") ||
-            status.startsWith("Executing") ||
-            status.startsWith("Loading") ? (
-              <span className="pending-indicator" />
-            ) : null}
-            {status === "Ready" ||
-            status === "Import complete." ||
-            status === "Query executed successfully."
-              ? ""
-              : status}
-          </div>
+        <div
+          className="flow-panel"
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={onDrop}
+        >
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            nodeTypes={nodeTypes}
+            onInit={setFlowInstance}
+            fitView
+            defaultEdgeOptions={{ animated: false }}
+          >
+            <MiniMap pannable zoomable />
+            <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
+            <Controls />
+          </ReactFlow>
 
-          {error ? <p className="error">{error}</p> : null}
-
-          <div className="results-panel">
-            <h3>Results</h3>
-
-            {queryResult.length === 0 ? (
-              <p className="empty-state">No rows returned yet.</p>
-            ) : (
-              <div className="table-results-wrapper">
-                <table className="result-table">
-                  <thead>
-                    <tr>
-                      {queryColumns.map((column) => (
-                        <th key={column}>{column}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {queryResult.map((row, rowIndex) => (
-                      <tr key={`row-${rowIndex}`}>
-                        {queryColumns.map((column) => (
-                          <td key={`${rowIndex}-${column}`}>
-                            {serializeCellValue(row[column])}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+          {nodes.length === 0 ? (
+            <div className="canvas-empty-state">
+              <div className="canvas-empty-card">
+                <h2>Drop a CSV file to start</h2>
+                <p>
+                  Each file becomes a node in the canvas. Create a derived table
+                  node from it to keep DuckDB updates in sync.
+                </p>
               </div>
-            )}
-          </div>
-        </section>
-      </main>
+            </div>
+          ) : null}
+        </div>
+      </div>
     </>
   );
 }
