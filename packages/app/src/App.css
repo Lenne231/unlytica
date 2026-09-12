@@ -1,0 +1,20 @@
+.worker-demo {
+  min-height: 100vh;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  gap: 12px;
+  background: #111827;
+  color: #f9fafb;
+}
+
+.worker-demo h1 {
+  margin: 0;
+  font-size: 2rem;
+}
+
+.worker-demo p {
+  margin: 0;
+  font-size: 1.25rem;
+  color: #d1d5db;
+}
