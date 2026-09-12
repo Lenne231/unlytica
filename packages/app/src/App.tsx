@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import "./App.css";
 
-const worker = new Worker(new URL("./worker.ts", import.meta.url), {
+const worker = new Worker(new URL("./worker/index.ts", import.meta.url), {
   type: "module",
 });
 
