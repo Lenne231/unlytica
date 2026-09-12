@@ -49,6 +49,8 @@ type TableNodeData = {
   sourceFileId: string;
   dbTableName: string;
   query: string;
+  isPreviewLoading?: boolean;
+  onShowRows?: (nodeId: string) => Promise<void>;
   onRemove?: (nodeId: string) => void;
 };
 
@@ -61,6 +63,13 @@ type Toast = {
   id: number;
   message: string;
   type: ToastType;
+};
+
+type TablePreview = {
+  tableNodeId: string;
+  tableName: string;
+  columns: string[];
+  rows: Record<string, unknown>[];
 };
 
 const FLOW_STORAGE_KEY = "unlytica-flow-graph";
@@ -112,7 +121,9 @@ function stripRuntimeData(node: FlowNode): FlowNode {
   const persistedData = { ...(node.data as Record<string, unknown>) };
   delete persistedData.onReplace;
   delete persistedData.onCreateTable;
+  delete persistedData.onShowRows;
   delete persistedData.onRemove;
+  delete persistedData.isPreviewLoading;
 
   return {
     ...node,
@@ -354,6 +365,15 @@ function TableNodeCard({
 
       <div className="flow-node-title">{tableData.tableName}</div>
       <div className="flow-node-subtitle">Derived table</div>
+      <div className="flow-node-actions">
+        <button
+          type="button"
+          onClick={() => void tableData.onShowRows?.(id)}
+          disabled={tableData.isPreviewLoading}
+        >
+          {tableData.isPreviewLoading ? "Loading..." : "Show first 100 rows"}
+        </button>
+      </div>
       <div className="table-query-preview">{tableData.query}</div>
     </div>
   );
@@ -367,6 +387,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [status, setStatus] = useState("Canvas ready");
+  const [tablePreview, setTablePreview] = useState<TablePreview | null>(null);
   const [isHydrated, setIsHydrated] = useState(false);
   const [isBooting, setIsBooting] = useState(true);
 
@@ -430,6 +451,78 @@ function App() {
     edgesRef.current = edges;
   }, [edges]);
 
+  const setTablePreviewLoading = useCallback(
+    (nodeId: string, isPreviewLoading: boolean) => {
+      setNodes((currentNodes) =>
+        currentNodes.map((candidate) => {
+          const candidateData = candidate.data as Partial<TableNodeData>;
+          if (candidate.id !== nodeId || candidateData.kind !== "table") {
+            return candidate;
+          }
+
+          return {
+            ...candidate,
+            data: {
+              ...candidateData,
+              isPreviewLoading,
+            },
+          };
+        }),
+      );
+    },
+    [setNodes],
+  );
+
+  const showTableRowsPreview = useCallback(
+    async (nodeId: string) => {
+      const tableNode = nodesRef.current.find(
+        (candidate) => candidate.id === nodeId,
+      );
+      const tableData = tableNode?.data as Partial<TableNodeData> | undefined;
+      if (!tableNode || tableData?.kind !== "table") {
+        return;
+      }
+
+      setTablePreviewLoading(nodeId, true);
+      setError(null);
+
+      try {
+        await ensureDb();
+
+        const dbTableName = String(tableData.dbTableName ?? "");
+        const queryResult = await conn!.query<any>(
+          `SELECT * FROM "${dbTableName}" LIMIT 100;`,
+        );
+        const rows = queryResult.toArray() as Record<string, unknown>[];
+        const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+
+        setTablePreview({
+          tableNodeId: nodeId,
+          tableName: String(tableData.tableName ?? tableNode.id),
+          columns,
+          rows,
+        });
+        setStatus(
+          `Showing first ${rows.length} rows from ${String(tableData.tableName ?? tableNode.id)}`,
+        );
+      } catch (previewError) {
+        const message =
+          previewError instanceof Error
+            ? previewError.message
+            : "Failed to load table rows.";
+        setError(message);
+        setToast({
+          id: Date.now(),
+          message: "Unable to show table rows.",
+          type: "error",
+        });
+      } finally {
+        setTablePreviewLoading(nodeId, false);
+      }
+    },
+    [setTablePreviewLoading],
+  );
+
   const removeNode = useCallback(
     async (nodeId: string) => {
       const currentNodes = nodesRef.current;
@@ -469,6 +562,13 @@ function App() {
           (edge) => edge.source !== nodeId && edge.target !== nodeId,
         ),
       );
+      setTablePreview((currentPreview) => {
+        if (!currentPreview || currentPreview.tableNodeId !== nodeId) {
+          return currentPreview;
+        }
+
+        return null;
+      });
       setToast({
         id: Date.now(),
         message: "Node and backing resource removed.",
@@ -639,13 +739,16 @@ function App() {
         ...node,
         data: {
           ...nodeData,
+          onShowRows: async (nodeId: string) => {
+            await showTableRowsPreview(nodeId);
+          },
           onRemove: (nodeId: string) => {
             void removeNode(nodeId);
           },
         } as unknown as TableNodeData,
       };
     },
-    [refreshGraph, removeNode],
+    [refreshGraph, removeNode, showTableRowsPreview],
   );
 
   const addFileNode = useCallback(
@@ -841,6 +944,70 @@ function App() {
 
         <div className="status-bar">{status}</div>
         {error ? <div className="error-banner">{error}</div> : null}
+        {tablePreview ? (
+          <div
+            className="table-preview-dialog-backdrop"
+            role="presentation"
+            onClick={(event) => {
+              if (event.target === event.currentTarget) {
+                setTablePreview(null);
+              }
+            }}
+          >
+            <section
+              className="table-preview-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-label={`Preview for ${tablePreview.tableName}`}
+            >
+              <div className="table-preview-header">
+                <div>
+                  <h2>{tablePreview.tableName}</h2>
+                  <p>Showing first {tablePreview.rows.length} rows</p>
+                </div>
+                <button
+                  type="button"
+                  className="node-close-button"
+                  aria-label="Close table preview"
+                  onClick={() => setTablePreview(null)}
+                >
+                  ×
+                </button>
+              </div>
+
+              {tablePreview.rows.length === 0 ? (
+                <div className="table-preview-empty">
+                  No rows found for this table.
+                </div>
+              ) : (
+                <div className="table-preview-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        {tablePreview.columns.map((column) => (
+                          <th key={column}>{column}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tablePreview.rows.map((row, rowIndex) => (
+                        <tr key={`${tablePreview.tableNodeId}-row-${rowIndex}`}>
+                          {tablePreview.columns.map((column) => (
+                            <td
+                              key={`${tablePreview.tableNodeId}-${rowIndex}-${column}`}
+                            >
+                              {String(row[column] ?? "")}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+          </div>
+        ) : null}
 
         <div
           className="flow-panel"
