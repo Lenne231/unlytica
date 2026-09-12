@@ -2,15 +2,11 @@ import {
   Background,
   BackgroundVariant,
   Controls,
-  Handle,
   MarkerType,
   MiniMap,
-  Position,
   ReactFlow,
   useEdgesState,
   useNodesState,
-  type Edge,
-  type Node,
   type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -23,361 +19,32 @@ import {
   type ChangeEvent,
   type DragEvent,
 } from "react";
-import * as duckdb from "@duckdb/duckdb-wasm";
-import duckdbWasm from "@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url";
-import mvpWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url";
-import duckdbWasmEh from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
-import ehWorker from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
 import "./App.css";
-
-type FileNodeData = {
-  kind: "file";
-  fileId: string;
-  fileName: string;
-  csvText: string;
-  resourceName: string;
-  createdAt: number;
-  onReplace?: (nodeId: string, file: File) => Promise<void>;
-  onCreateTable?: (fileNodeId: string) => void;
-  onRemove?: (nodeId: string) => void;
-};
-
-type TableNodeData = {
-  kind: "table";
-  tableId: string;
-  tableName: string;
-  sourceFileId: string;
-  dbTableName: string;
-  query: string;
-  isPreviewLoading?: boolean;
-  onShowRows?: (nodeId: string) => Promise<void>;
-  onRemove?: (nodeId: string) => void;
-};
-
-type FlowNode = Node<Record<string, unknown>>;
-type FlowEdge = Edge;
-
-type ToastType = "success" | "error" | "info";
-
-type Toast = {
-  id: number;
-  message: string;
-  type: ToastType;
-};
-
-type TablePreview = {
-  tableNodeId: string;
-  tableName: string;
-  columns: string[];
-  rows: Record<string, unknown>[];
-};
-
-const FLOW_STORAGE_KEY = "unlytica-flow-graph";
-const FLOW_DB_NAME = "unlytica-flow-db";
-const FLOW_DB_STORE = "graph";
-
-let db: duckdb.AsyncDuckDB | null = null;
-let conn: duckdb.AsyncDuckDBConnection | null = null;
-let dbInitPromise: Promise<void> | null = null;
-
-function openGraphStore() {
-  return new Promise<IDBDatabase>((resolve, reject) => {
-    if (typeof window === "undefined" || !("indexedDB" in window)) {
-      reject(new Error("IndexedDB is unavailable."));
-      return;
-    }
-
-    const request = window.indexedDB.open(FLOW_DB_NAME, 1);
-
-    request.onupgradeneeded = () => {
-      const database = request.result;
-      if (!database.objectStoreNames.contains(FLOW_DB_STORE)) {
-        database.createObjectStore(FLOW_DB_STORE);
-      }
-    };
-
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () =>
-      reject(request.error ?? new Error("Failed to open graph store."));
-  });
-}
-
-function sanitizeTableName(value: string) {
-  return (
-    value
-      .trim()
-      .replace(/\.[^/.]+$/, "")
-      .replace(/[^a-zA-Z0-9_]/g, "_")
-      .replace(/^\d+/, "_$&")
-      .replace(/^_+|_+$/g, "") || "uploaded_csv"
-  );
-}
-
-function buildNodeId(prefix: string) {
-  return `${prefix}_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
-}
-
-function stripRuntimeData(node: FlowNode): FlowNode {
-  const persistedData = { ...(node.data as Record<string, unknown>) };
-  delete persistedData.onReplace;
-  delete persistedData.onCreateTable;
-  delete persistedData.onShowRows;
-  delete persistedData.onRemove;
-  delete persistedData.isPreviewLoading;
-
-  return {
-    ...node,
-    data: persistedData,
-  };
-}
-
-async function loadPersistedFlow() {
-  if (typeof window === "undefined") {
-    return { nodes: [] as FlowNode[], edges: [] as FlowEdge[] };
-  }
-
-  try {
-    const db = await openGraphStore();
-    const payload = await new Promise<{
-      nodes?: FlowNode[];
-      edges?: FlowEdge[];
-    } | null>((resolve) => {
-      const transaction = db.transaction(FLOW_DB_STORE, "readonly");
-      const request = transaction
-        .objectStore(FLOW_DB_STORE)
-        .get(FLOW_STORAGE_KEY);
-
-      request.onsuccess = () =>
-        resolve(
-          (request.result as
-            | { nodes?: FlowNode[]; edges?: FlowEdge[] }
-            | undefined) ?? null,
-        );
-      request.onerror = () => resolve(null);
-    });
-
-    if (
-      payload &&
-      Array.isArray(payload.nodes) &&
-      Array.isArray(payload.edges)
-    ) {
-      return {
-        nodes: payload.nodes,
-        edges: payload.edges,
-      };
-    }
-
-    db.close();
-  } catch {
-    // Fall back to localStorage if IndexedDB is unavailable.
-  }
-
-  try {
-    const raw = window.localStorage.getItem(FLOW_STORAGE_KEY);
-    if (!raw) {
-      return { nodes: [] as FlowNode[], edges: [] as FlowEdge[] };
-    }
-
-    const parsed = JSON.parse(raw) as {
-      nodes?: FlowNode[];
-      edges?: FlowEdge[];
-    };
-    return {
-      nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
-      edges: Array.isArray(parsed.edges) ? parsed.edges : [],
-    };
-  } catch {
-    return { nodes: [] as FlowNode[], edges: [] as FlowEdge[] };
-  }
-}
-
-async function savePersistedFlow(nodes: FlowNode[], edges: FlowEdge[]) {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  const payload = {
-    nodes: nodes.map(stripRuntimeData),
-    edges,
-  };
-
-  try {
-    const db = await openGraphStore();
-    await new Promise<void>((resolve) => {
-      const transaction = db.transaction(FLOW_DB_STORE, "readwrite");
-      const request = transaction
-        .objectStore(FLOW_DB_STORE)
-        .put(payload, FLOW_STORAGE_KEY);
-
-      request.onsuccess = () => resolve();
-      request.onerror = () => resolve();
-    });
-    db.close();
-  } catch {
-    // Fall back to localStorage if IndexedDB is unavailable.
-  }
-
-  try {
-    window.localStorage.setItem(FLOW_STORAGE_KEY, JSON.stringify(payload));
-  } catch {
-    // Ignore quota or storage failures so a refreshed app can still render.
-  }
-}
-
-async function ensureDb() {
-  if (db && conn) {
-    return;
-  }
-
-  if (!dbInitPromise) {
-    dbInitPromise = (async () => {
-      const bundles: duckdb.DuckDBBundles = {
-        mvp: {
-          mainModule: duckdbWasm,
-          mainWorker: mvpWorker,
-        },
-        eh: {
-          mainModule: duckdbWasmEh,
-          mainWorker: ehWorker,
-        },
-      };
-
-      const bundle = await duckdb.selectBundle(bundles);
-      const worker = new Worker(bundle.mainWorker!);
-      const logger = new duckdb.ConsoleLogger();
-
-      db = new duckdb.AsyncDuckDB(logger, worker);
-      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
-      conn = await db.connect();
-    })();
-  }
-
-  await dbInitPromise;
-}
-
-function createTableQuery(sourceFileResourceName: string) {
-  return `SELECT * FROM read_csv_auto('${sourceFileResourceName}', header = true)`;
-}
-
-function createSourceResourceName(fileNodeId: string, fileName: string) {
-  const safeName = sanitizeTableName(fileName || "uploaded_csv");
-  return `${safeName}_${fileNodeId.replace(/[^a-zA-Z0-9_]/g, "_")}.csv`;
-}
-
-function buildDerivedTableName(
-  sourceFileName: string,
-  currentNodes: FlowNode[],
-) {
-  const baseName = sanitizeTableName(String(sourceFileName || "uploaded_csv"));
-  const existingCount = currentNodes.filter((candidate) => {
-    const candidateData = candidate.data as Partial<TableNodeData>;
-    return candidateData.kind === "table";
-  }).length;
-
-  return `${baseName}_table_${existingCount + 1}`;
-}
-
-function FileNodeCard({
-  data,
-  id,
-}: {
-  data: Record<string, unknown>;
-  id: string;
-}) {
-  const fileData = data as FileNodeData;
-  const inputRef = useRef<HTMLInputElement | null>(null);
-
-  if (fileData.kind !== "file") {
-    return null;
-  }
-
-  return (
-    <div className="flow-node file-node">
-      <Handle type="source" position={Position.Right} />
-      <div className="flow-node-header">
-        <span className="flow-node-tag file-tag">File</span>
-        <button
-          type="button"
-          className="node-close-button"
-          aria-label={`Remove ${fileData.fileName}`}
-          onClick={() => fileData.onRemove?.(id)}
-        >
-          ×
-        </button>
-      </div>
-
-      <div className="flow-node-title">{fileData.fileName}</div>
-      <div className="flow-node-subtitle">CSV source</div>
-
-      <div className="flow-node-actions">
-        <button type="button" onClick={() => inputRef.current?.click()}>
-          Replace
-        </button>
-        <button type="button" onClick={() => fileData.onCreateTable?.(id)}>
-          Create table
-        </button>
-      </div>
-
-      <input
-        ref={inputRef}
-        type="file"
-        accept=".csv,text/csv"
-        hidden
-        onChange={async (event) => {
-          const file = event.target.files?.[0];
-          if (file) {
-            await fileData.onReplace?.(id, file);
-          }
-          event.target.value = "";
-        }}
-      />
-    </div>
-  );
-}
-
-function TableNodeCard({
-  data,
-  id,
-}: {
-  data: Record<string, unknown>;
-  id: string;
-}) {
-  const tableData = data as TableNodeData;
-
-  if (tableData.kind !== "table") {
-    return null;
-  }
-
-  return (
-    <div className="flow-node table-node">
-      <Handle type="target" position={Position.Left} />
-      <div className="flow-node-header">
-        <span className="flow-node-tag table-tag">Table</span>
-        <button
-          type="button"
-          className="node-close-button"
-          aria-label={`Remove ${tableData.tableName}`}
-          onClick={() => tableData.onRemove?.(id)}
-        >
-          ×
-        </button>
-      </div>
-
-      <div className="flow-node-title">{tableData.tableName}</div>
-      <div className="flow-node-subtitle">Derived table</div>
-      <div className="flow-node-actions">
-        <button
-          type="button"
-          onClick={() => void tableData.onShowRows?.(id)}
-          disabled={tableData.isPreviewLoading}
-        >
-          {tableData.isPreviewLoading ? "Loading..." : "Show first 100 rows"}
-        </button>
-      </div>
-      <div className="table-query-preview">{tableData.query}</div>
-    </div>
-  );
-}
+import { FileNodeCard, TableNodeCard } from "./features/flow/FlowNodeCards";
+import { TablePreviewDialog } from "./features/flow/TablePreviewDialog";
+import type {
+  FileNodeData,
+  FlowEdge,
+  FlowNode,
+  TableNodeData,
+  TablePreview,
+  Toast,
+} from "./features/flow/flowTypes";
+import {
+  buildDerivedTableName,
+  buildNodeId,
+  createSourceResourceName,
+  createTableQuery,
+  loadPersistedFlow,
+  savePersistedFlow,
+} from "./features/flow/flowUtils";
+import {
+  ensureDb,
+  executeSql,
+  getTablePreviewQuery,
+  dropTableIfExists,
+  registerCsvResource,
+} from "./features/flow/duckdb";
 
 function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -426,9 +93,9 @@ function App() {
             String(sourceFileData.fileName ?? "uploaded_csv"),
           );
         const csvText = String(sourceFileData.csvText ?? "");
-        await db!.registerFileText(csvResourceName, csvText);
+        await registerCsvResource(csvResourceName, csvText);
 
-        await conn!.query(
+        await executeSql(
           `CREATE OR REPLACE TABLE "${String(tableData.dbTableName ?? tableNode.id)}" AS ${String(tableData.query ?? "SELECT 1")};`,
         );
       }
@@ -490,9 +157,7 @@ function App() {
         await ensureDb();
 
         const dbTableName = String(tableData.dbTableName ?? "");
-        const queryResult = await conn!.query<any>(
-          `SELECT * FROM "${dbTableName}" LIMIT 100;`,
-        );
+        const queryResult = await getTablePreviewQuery(dbTableName);
         const rows = queryResult.toArray() as Record<string, unknown>[];
         const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
 
@@ -548,10 +213,8 @@ function App() {
       const tableData = nodeToDelete.data as Partial<TableNodeData>;
 
       await ensureDb();
-      if (tableData.kind === "table" && tableData.dbTableName && conn) {
-        await conn.query(
-          `DROP TABLE IF EXISTS "${String(tableData.dbTableName)}";`,
-        );
+      if (tableData.kind === "table" && tableData.dbTableName) {
+        await dropTableIfExists(String(tableData.dbTableName));
       }
 
       setNodes((currentNodesState) =>
@@ -883,12 +546,8 @@ function App() {
 
   const nodeTypes = useMemo(
     () => ({
-      fileNode: (props: { data: Record<string, unknown>; id: string }) => (
-        <FileNodeCard {...props} />
-      ),
-      tableNode: (props: { data: Record<string, unknown>; id: string }) => (
-        <TableNodeCard {...props} />
-      ),
+      fileNode: FileNodeCard,
+      tableNode: TableNodeCard,
     }),
     [],
   );
@@ -944,70 +603,10 @@ function App() {
 
         <div className="status-bar">{status}</div>
         {error ? <div className="error-banner">{error}</div> : null}
-        {tablePreview ? (
-          <div
-            className="table-preview-dialog-backdrop"
-            role="presentation"
-            onClick={(event) => {
-              if (event.target === event.currentTarget) {
-                setTablePreview(null);
-              }
-            }}
-          >
-            <section
-              className="table-preview-dialog"
-              role="dialog"
-              aria-modal="true"
-              aria-label={`Preview for ${tablePreview.tableName}`}
-            >
-              <div className="table-preview-header">
-                <div>
-                  <h2>{tablePreview.tableName}</h2>
-                  <p>Showing first {tablePreview.rows.length} rows</p>
-                </div>
-                <button
-                  type="button"
-                  className="node-close-button"
-                  aria-label="Close table preview"
-                  onClick={() => setTablePreview(null)}
-                >
-                  ×
-                </button>
-              </div>
-
-              {tablePreview.rows.length === 0 ? (
-                <div className="table-preview-empty">
-                  No rows found for this table.
-                </div>
-              ) : (
-                <div className="table-preview-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        {tablePreview.columns.map((column) => (
-                          <th key={column}>{column}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {tablePreview.rows.map((row, rowIndex) => (
-                        <tr key={`${tablePreview.tableNodeId}-row-${rowIndex}`}>
-                          {tablePreview.columns.map((column) => (
-                            <td
-                              key={`${tablePreview.tableNodeId}-${rowIndex}-${column}`}
-                            >
-                              {String(row[column] ?? "")}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </section>
-          </div>
-        ) : null}
+        <TablePreviewDialog
+          tablePreview={tablePreview}
+          onClose={() => setTablePreview(null)}
+        />
 
         <div
           className="flow-panel"
